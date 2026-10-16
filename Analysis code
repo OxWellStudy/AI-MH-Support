@@ -1,0 +1,771 @@
+##########################################################################
+#  This analysis uses OxWell data (oxwell.org; osf.io/sekhr) to explore  #
+#        students' use of LLMs for mental health support                 #
+##########################################################################
+
+library(compareGroups)
+library(writexl)
+library(dplyr)
+library(tidyverse)
+library(car)
+library(broom)
+library(scales)
+library(ggplot2)
+library(stringr)
+library(grid)
+library(patchwork)
+
+############################ DATA IMPORT ################################# 
+# Data are imported using cyphr:
+if ( 0 ) {
+  OXWELL.DATA.DIR <- "" # Path to OxWell data
+  PERSONAL.SSH.DIR <- "" # Path to personal SSH key (for decrypting OxWell data)
+  PERSONAL.DIR <- "" # Path to personal wd 
+} else {
+  source("local.R")
+}
+
+KEY <- cyphr::data_key(path_data=OXWELL.DATA.DIR,path_user=PERSONAL.SSH.DIR)
+DATA <- cyphr::decrypt_object(key=KEY, 
+                              data=file.path(OXWELL.DATA.DIR, "DATA2025/OXWELL2025.R14-analysis.rds-cyphr") )
+setwd(PERSONAL.DIR)
+
+data <- subset(DATA, SURVEY.CORE=="TRUE")
+
+# Restricting dataset to those likely to have seen the question on AI/LLM use (X3200f) by eliminating responses
+  # indicating that the participant likely did not reach that question as all subsequent questions 
+  # had no response 
+data = as.data.frame(DATA[DATA$X3200f != "NoResponse(Stopped_vB)",])
+
+#### OVERALL DATA PREP ####
+data = data %>%
+  rename(
+    gender = OXWELL.GENDER.TGD,
+    age = X1030,
+    ethnicity = X1040,
+    keystage = KEYSTAGE,
+    neurodiversity = X1082,
+    pd_mh = X2140,
+    pd_sm = X2150,
+    bullying = X1425,
+    loneliness = X1780,
+    dsh = X2120,
+    hungry = X1500,
+    RCADS = RCADS25.TOTAL.IMPUTEtscore,
+    utility = X3200fB
+  )
+
+data$RCADS_scaled <- scale(data$RCADS)
+
+data = droplevels(data)
+
+# Change NoResponse(Item) to NA (equiv. to item-level missingness)
+data <- data %>%
+  mutate(across(c(
+    "gender" ,
+    "age",
+    "ethnicity" , 
+    "neurodiversity" , 
+    "keystage" , 
+    "pd_mh" ,
+    "pd_sm" , 
+    "bullying" , 
+    "loneliness" , 
+    "hungry" , 
+    "dsh"
+  ), ~ na_if(as.character(.x), "NoResponse(Item)")))
+
+# In the age variable, the secondary school survey maxed out at 'A19+' whereas in the 
+  # further education survey, it maxed out at age '21+'. 
+table(data$age) # 317 = 1.3% are >18 yrs - exclude from the mean calculation
+
+# Recoding age to numeric (was in A11, A12, etc. format) 
+data$age_numeric <- case_when(
+  as.character(data$age) %in% paste0("A", 9:20) ~
+    as.numeric(sub("A", "", as.character(data$age)))
+)
+
+# Remove those >18 (as the '+' means we don't know exact age)
+data$age_numeric[data$age_numeric==19] <- NA
+data$age_numeric[data$age_numeric==20] <- NA
+
+data$bullying[data$bullying == "I have not been bullied in the past couple of months"] <- "Nil in past 2 months"
+
+# Combining Arab into 'other ethnic group' to align with ONS Census 6a classification
+data$ethnicity_clean <- ifelse(data$ethnicity %in% c("Arab", "Other Ethnic Group") , "Other Ethnic Group", 
+                               as.character(data$ethnicity))
+
+# Combining parental mental health conditions & substance misuse into a single variable
+ # N.B. if either variable is NA, these will be treated as NA overall even if other variable 
+  # has a valid response.
+data$pd_clean <- ifelse(data$pd_mh == "Yes" | data$pd_sm == "Yes", "Yes",
+                        ifelse(data$pd_mh == "No" & data$pd_sm == "No", "No",
+                               ifelse (data$pd_mh == "Prefer not to say" | data$pd_sm == "Prefer not to say", "Prefer not to say",
+                                       ifelse(data$pd_mh == "Don't know" | data$pd_sm == "Don't know", "Don't know",
+                                              as.character(data$pd_clean)))))
+
+#Re-levelling within the factors individually
+data$gender <- factor(data$gender,levels = c("Boy / Man", "Girl / Woman", "Trans/Gender Diverse", "Don't know / Not sure", "Prefer not to say"))
+data$ethnicity_clean <- factor(data$ethnicity_clean, levels = c("White", "Asian/Asian British", "Black/African/Caribbean/Black British", "Mixed/Multiple Ethnic Groups", "Other Ethnic Group"))
+data$neurodiversity <- factor(data$neurodiversity, levels = c("No", "Yes", "Not sure", "Prefer not to say"))
+data$keystage <- factor(data$keystage, levels = c("KS3", "KS4", "KS5"))
+data$pd_clean <- factor(data$pd_clean, levels = c("No", "Yes", "Don't know", "Prefer not to say"))
+data$bullying <- factor(data$bullying, levels = c("Nil in past 2 months", "Once, twice or a few times", "2 or 3 times a month", "About once a week", "Several times a week"))
+data$loneliness <- factor(data$loneliness, levels = c("Hardly ever or never", "Some of the time", "Often"))
+data$dsh <- factor(data$dsh, levels = c("No", "Yes", "Prefer not to say", "Not sure what this means"))
+data$hungry <- factor(data$hungry, levels = c("Never or hardly ever", "Some of the time", "Often"))
+
+#### OUTCOME 1 [AI USE]: DATA PREP ####
+# Outcome = 'In the last year, have you received mental health support from any of the following 
+  # digital and online sources, that you haven't already told us about? Please tick all that apply. 'f' = AI/LLM platforms
+    # As this is a tickbox question, item-level non-response is taken to indicate 'no', as we have already removed the 
+      # participants who likely did not make it this far in the survey (i.e. the 'NoResponse (Stopped)'s). 
+data1 <- data
+data1$X3200f <- as.character(data1$X3200f)
+data1$X3200f[data1$X3200f == "NoResponse(Item)"] <- "No"
+data1$X3200f[data1$X3200f == "Ticked (Yes)"] <- "Yes"
+data1$X3200f <- factor(data1$X3200f, levels = c("No", "Yes"))
+
+#### OVERALL SAMPLE DESCRIPTIVES (TABLE S2.1) ####
+summary(data$age_numeric)
+sd(data$age_numeric, na.rm = T)
+
+table <- compareGroups(~ gender + keystage + ethnicity_clean + neurodiversity + dsh
+                       + RCADS + pd_clean + bullying +loneliness + hungry + RCADS,
+                       data = data1,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+
+#write_xlsx(output, "Tables/Descriptives overall npj R1.xlsx")
+
+#### OUTCOME 1 [AI USE]: TABLE S2.1. Descriptive statistics by whether or not they've accessed AI/LLM support ####
+table <- compareGroups(X3200f ~ gender + keystage + ethnicity_clean + neurodiversity + dsh
+                       + pd_clean + bullying +loneliness + hungry + RCADS + RCADS_scaled,
+                       data = data1,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+
+#write_xlsx(output, "Tables/Descriptives by outcome [use] R14.xlsx")
+
+#### OUTCOME 1 [AI USE]: LOGISTIC REGRESSION (TABLE S2.1) ####
+data1$AI_use <- ifelse(data1$X3200f == "Yes", 1, 0) #Classifying the AI question into a binary outcome
+
+model1 <- glm(AI_use ~ gender + keystage + ethnicity_clean + neurodiversity + dsh + RCADS_scaled + pd_clean + bullying + loneliness + hungry,
+             data = data1,
+             family = binomial)
+
+summary(model1)
+
+results <- tidy(model1, conf.int = TRUE, exponentiate = TRUE)
+
+results[] <- lapply(names(results), function(col_name) {
+  x <- results[[col_name]]
+  if (is.numeric(x)) {
+    if (col_name == "p.value") {
+      sprintf("%.3f", x)
+    } else {
+      sprintf("%.2f", x)
+    }
+  } else {
+    x
+  }
+})
+
+
+results[["Coefficient [95% CI]"]] <-
+  paste0(
+    results$estimate, " [", results$conf.low,", ", results$conf.high, "]"
+  )
+
+#write_xlsx(results, "Regression output/Use R14.xlsx")
+
+#### OUTCOME 2 [AI HELPFUL]: DATA PREP ####
+# Outcome = 'How helpful was the support?' [contingent on having sought support].
+
+# First, restrict to those who have said that they have used AI/LLM support
+data2 = as.data.frame(data1[data1$X3200f == "Yes",])
+
+# Then restrict to those who likely saw the question (i.e. eliminate 'Stopped' responses)
+data2 = as.data.frame(data2[data2$utility != "NoResponse(Stopped_vB)",])
+
+data2$utility <- as.character(data2$utility)
+data2$utility[data2$utility == "NoResponse(Item)"] <- NA # N.B. The reason for treating this differently than above is 
+                                                          # that it's a radio button rather than tickbox format
+
+data2$utility <- factor(data2$utility, levels = c("Unhelpful", "Neither helpful nor unhelpful", "Helpful"))
+
+#### OUTCOME 2 [AI HELPFUL]: TABLE S2.2. Descriptive statistics by whether or not they find AI/LLM support useful ####
+table <- compareGroups(utility ~ gender + keystage + ethnicity_clean + neurodiversity + dsh + pd_clean + 
+                         bullying + loneliness + hungry + RCADS + RCADS_scaled,
+                       data = data2,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+
+#write_xlsx(output, "Tables/Descriptives by outcome [helfpulness 3-cat] R14.xlsx")
+
+#### OUTCOME 2 [AI HELPFUL]: LOGISTIC REGRESSION (TABLE S2.2) ####
+data2$utility2 <- ifelse(data2$utility %in% c("Neither helpful nor unhelpful", "Unhelpful") , "Not helpful", 
+                       as.character(data2$utility))
+data2$utility2 <- factor(data2$utility2, levels = c("Not helpful", "Helpful"))
+
+table <- compareGroups(utility2 ~ gender + keystage + ethnicity_clean + neurodiversity  + dsh
+                       + RCADS + pd_clean + bullying +loneliness + hungry + RCADS_scaled,
+                       data = data2,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+
+#write_xlsx(output, "Tables/Descriptives by outcome [helfpulness 2-cat] R14.xlsx")
+
+data2$utility2 <- ifelse(data2$utility2 == "Helpful", 1, 0)
+
+model2 <- glm(utility2 ~ gender + keystage + ethnicity_clean + neurodiversity + dsh + 
+               RCADS_scaled + pd_clean + bullying + loneliness + hungry,
+             data = data2,
+             family = binomial)
+
+results <- tidy(model2, conf.int = TRUE, exponentiate = TRUE)
+
+results[] <- lapply(names(results), function(col_name) {
+  x <- results[[col_name]]
+  if (is.numeric(x)) {
+    if (col_name == "p.value") {
+      sprintf("%.3f", x)
+    } else {
+      sprintf("%.2f", x)
+    }
+  } else {
+    x
+  }
+})
+
+results[["Coefficient [95% CI]"]] <-
+  paste0(
+    results$estimate, " [", results$conf.low,", ", results$conf.high, "]"
+  )
+
+#write_xlsx(results, "Regression output/Helpful R14.xlsx")
+
+#### OUTCOME 3 [UNMET NEEDS]: DATA PREP ####
+# Outcome = 'In the last year, would you have liked to access additional mental health support from any of the following?'
+ 
+# Restricting to those who have (1) accessed AI & (2) reached the question re: desire for add'l support (eliminating 'Stopped')
+data3 = as.data.frame(data1[(data1$X3200f == "Yes" & data1$X2220g != "NoResponse(Stopped_vB)"),])
+
+# Generating the outcome - 7 different tickbox options where 'Ticked (Yes)' = Yes and 'NoResponse (Item)" = No
+cols <- c("X2220a","X2220b","X2220c","X2220d","X2220e","X2220f","X2220g")
+data3$need <- ifelse(rowSums(data3[cols] == "Ticked (Yes)", na.rm = TRUE) > 0, "Yes", "No")
+
+#### OUTCOME 3 [UNMET NEEDS]: TABLE S2.3. Descriptive statistics by unmet needs ####
+table <- compareGroups(need ~ gender + keystage + ethnicity_clean + neurodiversity + dsh
+                       + RCADS + pd_clean + bullying +loneliness + hungry + RCADS_scaled,
+                       data = data3,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+
+#write_xlsx(output, "Tables/Descriptives by outcome [unmet need] R14.xlsx")
+
+#### OUTCOME 3 [UNMET NEEDS]: LOGISTIC REGRESSION (TABLE S2.3) ####
+data3$need <- ifelse(data3$need == "Yes", 1, 0)
+
+model3 <- glm(need ~ gender + keystage + ethnicity_clean + neurodiversity + dsh + RCADS_scaled + pd_clean + bullying + loneliness + hungry,
+             data = data3,
+             family = binomial)
+
+summary(model3)
+
+results <- tidy(model3, conf.int = TRUE, exponentiate = TRUE)
+
+results[] <- lapply(names(results), function(col_name) {
+  x <- results[[col_name]]
+  if (is.numeric(x)) {
+    if (col_name == "p.value") {
+      sprintf("%.3f", x)
+    } else {
+      sprintf("%.2f", x)
+    }
+  } else {
+    x
+  }
+})
+
+results[["Coefficient [95% CI]"]] <-
+  paste0(
+    results$estimate, " [", results$conf.low,", ", results$conf.high, "]"
+  )
+
+#write_xlsx(results, "Regression output/Unmet needs R14.xlsx")
+
+#### OUTCOMES 1-3: Calculating p-values w/ profile likelihood #### 
+
+#### Known package issue - the p-values from tidy are derived from Wald tests so do not align
+  # with profile likelihood CIs calculated (see https://github.com/tidymodels/broom/issues/1074). 
+   # The following code manually calculates the p-values that correspond with the CIs for each
+    # of the three fitted models.
+
+p_LR <- function(fit) {
+  model <- model.matrix(fit)
+  sapply(colnames(model)[-1], function(v) {
+    fit0 <- glm.fit(model[, colnames(model) != v], fit$y, family = binomial())
+    pchisq(fit0$deviance - fit$deviance, df = 1, lower.tail = FALSE)
+  })
+}
+
+# Outcome 1
+CI <- exp(confint(model1)[-1, ])
+est1 <- data.frame(OR= round(exp(coef(model1)[-1]), 2),
+                      CI.LR = sprintf("[%.2f, %.2f]", CI[, 1], CI[, 2]),
+                      p.LR = round(p_LR(model1), 4))
+est1
+
+# Outcome 2
+CI <- exp(confint(model2)[-1, ])
+est2 <- data.frame(OR= round(exp(coef(model2)[-1]), 2),
+                      CI.LR = sprintf("[%.2f, %.2f]", CI[, 1], CI[, 2]),
+                      p.LR = round(p_LR(model2), 4))
+est2
+
+# Outcome 3 
+CI <- exp(confint(model3)[-1, ])
+est3 <- data.frame(OR= round(exp(coef(model3)[-1]), 2),
+                      CI.LR = sprintf("[%.2f, %.2f]", CI[, 1], CI[, 2]),
+                      p.LR = round(p_LR(model3), 4))
+est3
+
+
+#### OUTCOMES 1-3: FIG 2 COMBINED FOREST PLOT ####
+# Labelling, ordering levels, etc. 
+labels <- c(
+  gender          = "Gender (ref. Boy/Man): ",
+  keystage        = "Key Stage (ref. KS3): ",
+  ethnicity_clean = "Ethnicity (ref. White): ",
+  neurodiversity  = "Self-Identified Neurodivergence (ref. No): ",
+  dsh             = "Deliberate Self-Harm (ref. No): ",
+  RCADS_scaled    = "Depression and Anxiety (Scaled RCADS Score)",
+  pd_clean        = "Parent Mental Health & Substance Use (ref. No): ",
+  bullying        = "Bullying (ref. None): ",
+  loneliness      = "Loneliness (ref. Hardly Ever or Never): ",
+  hungry          = "Food Insecurity (ref. Never or Hardly Ever): "
+)
+
+var_order <- c("hungry", "loneliness", "bullying", "pd_clean",
+               "RCADS_scaled", "dsh", "neurodiversity", "ethnicity_clean", "keystage", "gender")
+
+level_order <- list(
+  keystage = c("KS5", "KS4"),
+  gender = c("Prefer not to say", "Don't know / Not sure", "Trans/Gender Diverse", "Girl / Woman"),
+  ethnicity_clean = c("Other Ethnic Group", "Mixed/Multiple Ethnic Groups", "Black/African/Caribbean/Black British", "Asian/Asian British"),
+  neurodiversity = c("Prefer not to say", "Not sure", "Yes"),
+  dsh = c("Not sure what this means", "Prefer not to say", "Yes"),
+  pd_clean = c("Prefer not to say", "Don't know", "Yes"),
+  bullying = c("Several times a week", "About once a week", "2 or 3 times a month", "Once, twice or a few times"),
+  loneliness = c("Often", "Some of the time"),
+  hungry = c("Often", "Some of the time")
+)
+
+# Pull results from OUTCOMES 1-3 regression analyses
+results <- bind_rows(
+  broom::tidy(model1, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "AI/LLM Use"),
+  broom::tidy(model2, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "AI/LLM Helpfulness"),
+  broom::tidy(model3, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "Unmet Needs")
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = as.character(term),
+    estimate = as.numeric(estimate),
+    conf.low = as.numeric(conf.low),
+    conf.high = as.numeric(conf.high)
+  ) %>%
+  mutate(
+    base_var = case_when(
+      str_starts(term, "gender") ~ "gender",
+      str_starts(term, "keystage") ~ "keystage",
+      str_starts(term, "ethnicity_clean") ~ "ethnicity_clean",
+      str_starts(term, "neurodiversity") ~ "neurodiversity",
+      str_starts(term, "dsh") ~ "dsh",
+      str_starts(term, "RCADS_scaled") ~ "RCADS_scaled",
+      str_starts(term, "pd_clean") ~ "pd_clean",
+      str_starts(term, "bullying") ~ "bullying",
+      str_starts(term, "loneliness") ~ "loneliness",
+      str_starts(term, "hungry") ~ "hungry",
+      TRUE ~ term
+    ),
+    level = str_remove(term, base_var) %>% str_trim(),
+    label = if_else(base_var %in% names(labels), paste0(labels[base_var], level), term)
+  ) %>%
+  mutate(model = factor(model, levels = c("AI/LLM Use", "AI/LLM Helpfulness", "Unmet Needs")))
+
+term_positions <- results %>%
+  distinct(base_var, level, label) %>%
+  mutate(
+    level_order_num = case_when(
+      base_var == "keystage" ~ match(level, level_order$keystage),
+      base_var == "gender" ~ match(level, level_order$gender),
+      base_var == "ethnicity_clean" ~ match(level, level_order$ethnicity_clean),
+      base_var == "neurodiversity" ~ match(level, level_order$neurodiversity),
+      base_var == "dsh" ~ match(level, level_order$dsh),
+      base_var == "pd_clean" ~ match(level, level_order$pd_clean),
+      base_var == "bullying" ~ match(level, level_order$bullying),
+      base_var == "loneliness" ~ match(level, level_order$loneliness),
+      base_var == "hungry" ~ match(level, level_order$hungry),
+      TRUE ~ row_number()
+    )
+  ) %>%
+  arrange(match(base_var, var_order), level_order_num) %>%
+  mutate(
+    var_change = base_var != lag(base_var, default = ""),
+    group_num = cumsum(var_change),
+    seq_pos = row_number(),
+    spacing = (group_num - 1) * 0.8,
+    y_pos = seq_pos + spacing
+  ) %>%
+  select(base_var, level, label, y_pos)
+
+results <- results %>%
+  left_join(term_positions %>% select(base_var, level, y_pos),
+            by = c("base_var", "level")) %>%
+  mutate(
+    plot_y = y_pos,               
+    show_point = !(base_var == "gender" &
+                     level %in% c("Don't know / Not sure", "Prefer not to say") &
+                     model %in% c("AI/LLM Helpfulness", "Unmet Needs")) # these are suppressed for n < 5
+  )
+
+# Subgroup sample size for analytic samples 
+subgroup_n <- function(model, model_name) {
+  md <- model$model
+  fvars <- names(md)[vapply(md, is.factor, logical(1))]
+  purrr::map_dfr(fvars, function(v) {
+    md %>%
+      count(level = as.character(.data[[v]]), name = "n_sub") %>%
+      mutate(base_var = v, model = model_name, .before = 1)
+  })
+}
+
+n_lookup <- bind_rows(
+  subgroup_n(model1, "AI/LLM Use"),
+  subgroup_n(model2, "AI/LLM Helpfulness"),
+  subgroup_n(model3, "Unmet Needs")
+) %>%
+  mutate(model = factor(model, levels = levels(results$model)))
+
+results <- results %>%
+  left_join(n_lookup, by = c("model", "base_var", "level"))
+
+# Quick manual check of subgroup ns (ensuring from analysed rather than full sample) - 
+# Test 1 - OUTCOME 1 
+vars <- c("gender", "keystage", "ethnicity_clean", "neurodiversity", "dsh",
+          "RCADS_scaled", "pd_clean", "bullying", "loneliness", "hungry", "AI_use")
+data1_n <- data1[complete.cases(data1[, vars]), vars]
+
+table <- compareGroups(~ gender + keystage + ethnicity_clean + neurodiversity + dsh
+                       + pd_clean + bullying +loneliness + hungry + RCADS_scaled,
+                       data = data1_n,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+output
+
+# Test 2 - OUTCOME 2 
+vars <- c("gender", "keystage", "ethnicity_clean", "neurodiversity", "dsh",
+          "RCADS_scaled", "pd_clean", "bullying", "loneliness", "hungry", "need")
+data3_n <- data3[complete.cases(data3[, vars]), vars]
+table <- compareGroups(~ gender + keystage + ethnicity_clean + neurodiversity + dsh
+                       + pd_clean + bullying +loneliness + hungry + RCADS_scaled,
+                       data = data3_n,
+                       byrow = TRUE)
+table<-createTable(table,show.ratio = TRUE)
+output <- as.data.frame(table$descr)
+output<-cbind(" "=rownames(output), output)
+output
+
+# Plotting results
+create_forest_plot <- function(data, outcome_name, outcome_title, sample_size, include_y_axis = TRUE) {
+  plot_data <- data %>% filter(model == outcome_name)
+  n_x <- 0.0825
+  
+  color <- case_when(
+    outcome_name == "AI/LLM Use" ~ "#65C2A5",
+    outcome_name == "AI/LLM Helpfulness" ~ "#FB8D62",
+    outcome_name == "Unmet Needs" ~ "#8DA0CB"
+  )
+  
+  shape <- case_when(
+    outcome_name == "AI/LLM Use" ~ 16,
+    outcome_name == "AI/LLM Helpfulness" ~ 17,
+    outcome_name == "Unmet Needs" ~ 15
+  )
+  
+  p <- ggplot(plot_data, aes(x = estimate, y = plot_y)) +
+    geom_point(size = 2.5, color = color, shape = shape,
+               data = filter(plot_data, show_point == TRUE)) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                   height = 0.3, linewidth = 0.75, color = color,
+                   data = filter(plot_data, show_point == TRUE)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "black", alpha = 0.5) +
+    
+    geom_text( # add subgroup ns
+      data = filter(plot_data, show_point == TRUE, !is.na(n_sub)),
+      aes(x = n_x, label = scales::comma(n_sub)),
+      size = 3, color = "grey30"
+    ) +
+    annotate("text", x = n_x, y = max(term_positions$y_pos) + 1.5,
+             label = "n", fontface = "bold", size = 3.2) +
+    
+    scale_x_log10(
+      limits = c(0.0675, 32),
+      breaks = c(0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32),
+      labels = c(".125", ".25", ".5", "1", "2", "4", "8", "16", "32")) +
+    scale_y_continuous(
+      breaks = term_positions$y_pos,
+      labels = if (include_y_axis) term_positions$label else rep("", nrow(term_positions)),
+      expand = expansion(mult = c(0.05, 0.05))
+    ) +
+    labs(
+      x = "aOR",
+      y = "",
+      title = outcome_title,
+      subtitle = paste0("(n = ", sample_size, ")")
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = if (include_y_axis) element_text(size = 12) else element_blank(),
+      plot.margin = margin(t = 20, r = 15, l = 10, b = 10, unit = "pt"),
+      axis.title.x = element_text(size = 10),
+      axis.title.y = element_blank(),
+      plot.title = element_text(size = 14, hjust = 0.5, face = "plain"),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic", margin = margin(t = 2, b = 5))
+    ) +
+    coord_cartesian(clip = "off")
+  
+  return(p)
+}
+
+p1 <- create_forest_plot(results, "AI/LLM Use", "AI/LLM Use", nobs(model1), include_y_axis = TRUE)
+p2 <- create_forest_plot(results, "AI/LLM Helpfulness", "AI/LLM Helpfulness", nobs(model2), include_y_axis = FALSE)
+p3 <- create_forest_plot(results, "Unmet Needs", "Unmet Needs", nobs(model3), include_y_axis = FALSE)
+
+combined <- p1 + p2 + p3 + plot_layout(ncol = 3, widths = c(1.3, 1, 1))
+combined
+
+ggsave(combined, filename = "Figures/Fig 2. Forest plot (R1).jpg", height = 10, width = 16)
+
+#### OUTCOME 4 [SUBSTITUTE/SUPPLEMENT]: DATA PREP ####
+# Outcome = Highest level of support sought in addition to AI/LLMs
+
+# Subset to those who had sought AI/LLM support
+data4 = as.data.frame(data[data$X3200f == "Ticked (Yes)",])
+
+# Creating composite support variables according to how presented in the survey
+cols_informal <- c("X2190a","X2190b","X2190c","X2190d","X2190e")
+cols_semi_formal <- c("X2200a","X2200b","X2200c","X2200d","X2200e","X2200f","X2200g",
+                       "X2200h","X2200i","X2200j","X2200k","X2200l","X2200m","X2200n")
+cols_formal <- c("X2210a","X2210b","X2210c","X2210d","X2210e","X2210f","X2210g","X2210h","X2210i")
+cols_online <- c("X3200a", "X3200b","X3200c","X3200d","X3200e","X3200g")
+
+# Binary variables of y/n across the different categories
+data4$online <- ifelse(rowSums(data4[cols_online] == "Ticked (Yes)") > 0, "Yes", "No")
+data4$informal <- ifelse(rowSums(data4[cols_informal] == "Ticked (Yes)") > 0, "Yes", "No")
+data4$semiformal <- ifelse(rowSums(data4[cols_semi_formal] == "Ticked (Yes)") > 0, "Yes", "No")
+data4$formal <- ifelse(rowSums(data4[cols_formal] == "Ticked (Yes)") > 0, "Yes", "No")
+
+# Creating a 'hierarchy' of support: 
+  # AI only 
+  # AI + other online (no informal, semiformal, or formal support)
+  # AI + informal support (+/- other online; no semiformal or formal)
+  # AI + semiformal support (+/- other online, informal; no formal)
+  # AI + formal support (+/- any other types)
+
+data4$othersupport <- ifelse(data4$formal=="Yes", "AI + Formal",
+                             ifelse(data4$semiformal == "Yes", "AI + Semiformal",
+                                    ifelse(data4$informal == "Yes", "AI + Informal", 
+                                           ifelse(data4$online == "Yes", "AI + Other online", "AI only"))))
+
+#### OUTCOME 4 [SUB/SUP] FINDINGS ####
+# N.B. we had originally wanted to report the findings in the same way as for the other outcomes, 
+ # but our numbers were so small that this wasn't feasible. 
+summary <- data4 %>%  
+  count(othersupport) %>%  
+  mutate(percent = round((n / sum(n)) * 100, 2))
+
+write_xlsx(summary,"Tables/Sup_Sub Findings (outcome 4) R14.xlsx")
+
+#### OUTCOME 4 [SUB/SUB] FIG 1 ####
+p<-summary %>%
+  mutate(othersupport = factor(othersupport, 
+                               levels = c("AI only", 
+                                          "AI + Other online", 
+                                          "AI + Informal", 
+                                          "AI + Semiformal", 
+                                          "AI + Formal")),
+        label = factor(case_when(
+           othersupport == "AI only" ~ "AI/LLMs only",
+           othersupport == "AI + Other online" ~ "Other online",
+           othersupport == "AI + Informal" ~ "Informal",
+           othersupport == "AI + Semiformal" ~ "Semi-formal",
+           othersupport == "AI + Formal" ~ "Formal"
+         ), levels = c("AI/LLMs only", "Other online", "Informal", "Semi-formal", "Formal"))) %>%
+  ggplot(aes(x = label, y = percent, fill = label)) +
+  geom_col(color = "black", linewidth = 0.5) +
+  geom_text(aes(label = paste0("n = ", n)), 
+            vjust = -0.5, size = 3.5, fontface = "plain") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Most Formal Level of Support Accessed in Addition to AI/LLMs",
+    x = "Type of Support",
+    y = "Percentage",
+    fill = "Support Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold")
+  )
+
+ggsave(p, filename="Figures/Fig 1 Support Hierarchy R14.jpg", height = 6, width = 8)
+
+#### ADDITIONAL FIGURE RECOMMENDED BY REVIEWER (FIG S2.1) ####
+# AI/LLM helpfulness (OUTCOME 2)
+helpful_summary <- data2 %>%
+  filter(!is.na(utility)) %>%
+  count(utility) %>%
+  mutate(
+    percent = 100 * n / sum(n),
+    utility = factor(
+      utility,
+      levels = c("Unhelpful",
+                 "Neither helpful nor unhelpful",
+                 "Helpful")
+    )
+  )
+
+p_helpful <- ggplot(
+  helpful_summary,
+  aes(x = utility, y = percent, fill = utility)
+) +
+  geom_col(color = "black", linewidth = 0.5) +
+  geom_text(
+    aes(label = paste0("n = ", n)),
+    vjust = -0.5,
+    size = 3.5
+  ) +
+  scale_fill_brewer(palette = "Set3") +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Perceived Helpfulness of AI/LLM Support (n = 580)",
+    x = "",
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(
+      hjust = 0.5,
+      size = 13,
+      face = "bold"
+    )
+  )
+
+# Perceived unmet needs (OUTCOME 3)
+unmet_summary <- data3 %>%
+  summarise(
+    X2220a = sum(X2220a == "Ticked (Yes)"),
+    X2220b = sum(X2220b == "Ticked (Yes)"),
+    X2220c = sum(X2220c == "Ticked (Yes)"),
+    X2220d = sum(X2220d == "Ticked (Yes)"),
+    X2220e = sum(X2220e == "Ticked (Yes)"),
+    X2220f = sum(X2220f == "Ticked (Yes)"),
+    X2220g = sum(X2220g == "Ticked (Yes)")
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "option",
+    values_to = "n"
+  ) %>%
+  mutate(
+    percent = 100 * n / nrow(data3)
+  )
+
+# Relabelling according to survey
+unmet_summary$option <- factor(
+  unmet_summary$option,
+  levels = c(
+    "X2220a",
+    "X2220b",
+    "X2220c",
+    "X2220d",
+    "X2220e",
+    "X2220f",
+    "X2220g"
+  ),
+  labels = c(
+    "Friend",
+    "Family",
+    "School",
+    "Community or youth organisation/charity",
+    "Health services and social care",
+    "Online/helpline",
+    "Other"
+  )
+)
+
+p_unmet <- ggplot(
+  unmet_summary,
+  aes(x = option, y = percent, fill = option)
+) +
+  geom_col(color = "black", linewidth = 0.5) +
+  geom_text(
+    aes(label = paste0("n = ", n)),
+    vjust = -0.5,
+    size = 3.2
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Additional Support Desired by AI/LLM Users (n = 649)",
+    x = "",
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      size = 9
+    ),
+    plot.title = element_text(
+      hjust = 0.5,
+      size = 13,
+      face = "bold"
+    )
+  )
+
+# Combining the panels
+combined_needs <- p_helpful + p_unmet +
+  plot_layout(ncol = 2, widths = c(1, 1.5))
+
+combined_needs
+
+ggsave(combined_needs, filename = "Figures/Fig S2.1 AI helpfulness and unmet needs R14.jpg", height = 7, width = 14)
